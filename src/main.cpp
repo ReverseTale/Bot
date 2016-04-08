@@ -1,7 +1,8 @@
 #include <iostream>
 #include <thread>
 
-#include "xHacking.h"
+#include <xhacking/include/>
+#include <xhacking/xHacking.h>
 #include "Utilities/Utilities.h"
 #include "Loader/Loader.h"
 #include "Detour/Detour.h"
