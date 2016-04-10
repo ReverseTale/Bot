@@ -27,7 +27,7 @@ endif()
 add_library(ReverseTale-Bot SHARED ${Bot_SOURCES})
 
 # ---[ Link dependencies libraries
-target_link_libraries(ReverseTale-Bot ws2_32 xHacking ReverseTale-Library)
+target_link_libraries(ReverseTale-Bot xHacking ReverseTale-Library)
 
 # ---[ Set C++11 standard
 set_property(TARGET ReverseTale-Bot PROPERTY CXX_STANDARD 11)
