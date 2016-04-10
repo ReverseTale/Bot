@@ -1,11 +1,10 @@
 #include <iostream>
 #include <thread>
 
-#include <xhacking/include/>
 #include <xhacking/xHacking.h>
-#include "Utilities/Utilities.h"
-#include "Loader/Loader.h"
-#include "Detour/Detour.h"
+#include <xhacking/Utilities/Utilities.h>
+#include <xhacking/Loader/Loader.h>
+#include <xhacking/Detour/Detour.h>
 
 #include <Tools/utils.h>
 #include <Game/packet.h>
@@ -89,7 +88,7 @@ int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 
 	/*
 	auto packets = packet->decrypt();
-	
+
 	if (!login)
 	{
 		if (session.id() != -1)
@@ -127,7 +126,7 @@ int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 	{
 		packet = gFactory->make(PacketType::SERVER_GAME, &session, NString(buf, len));
 	}
-	
+
 	auto packets = packet->decrypt();
 
 	for (auto packet : packets)
@@ -172,9 +171,9 @@ int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 		session.setID(sessionID);
 		session.setAlive(packets[0].tokens().from_int<uint32_t>(0));
 	}
-	
+
 	gFactory->recycle(packet);
-	
+
 	__asm POPFD;
 	__asm POPAD;
 
@@ -275,7 +274,7 @@ void processInput()
 		std::string input;
 		std::cout << "Enter Filter: ";
 		std::cin >> input;
-					
+
 		if (input.length() >= 2)
 		{
 			if (input.compare("toggle_hex") == 0)

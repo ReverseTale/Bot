@@ -14,6 +14,11 @@ set(Bot_SOURCES
 
 # ---[ Load dependencies
 find_package(xHacking   REQUIRED)
+if (${ReverseTale_DEV})
+    include_directories(${CMAKE_SOURCE_DIR}/src/Library/include)
+else()
+    find_package(ReverseTale-Library   REQUIRED)
+endif()
 
 # ---[ Add definitions and DLL
 if (NOT ${DEBUG})
