@@ -1,5 +1,6 @@
 #include <iostream>
 #include <thread>
+#include <mutex>
 
 #include <xhacking/xHacking.h>
 #include <xhacking/Utilities/Utilities.h>
@@ -22,10 +23,14 @@ std::vector<std::string> filterSend;
 std::vector<std::string> filterRecv;
 bool showAsHex = false;
 
-
+SOCKET sendSock;
+SOCKET recvSock;
 DWORD baseAddress = 0x681210;
 uint32_t sessionID;
+uint32_t ingameID;
 Utils::Game::Session session;
+
+std::mutex _sendMutex;
 
 
 void processInput();
@@ -71,9 +76,12 @@ Detour<int, int, const char*, int, int>* sendDetour = NULL;
 Detour<int, int, char*, int, int>* recvDetour = NULL;
 int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 {
-
 	__asm PUSHAD;
 	__asm PUSHFD;
+
+	sendSock = s;
+
+	std::lock_guard<std::mutex> lock(_sendMutex);
 
 	if (!threadCreated)
 	{
@@ -82,37 +90,6 @@ int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 		running = true;
 		inputThread = std::thread(processInput);
 		std::cout << "Done, joining" << std::endl;
-	}
-
-	int ret = 0;
-
-	/*
-	auto packets = packet->decrypt();
-
-	if (!login)
-	{
-		if (session.id() != -1)
-		{
-			for (auto packet : packets)
-			{
-				NString newPacket;
-				for (int i = 1; i < packet.tokens().length(); ++i)
-				{
-					newPacket << ' ' << packet.tokens()[i];
-				}
-
-				auto reencryptedPacket = gFactory->make(PacketType::CLIENT_GAME, &session, newPacket);
-				reencryptedPacket->commit();
-				reencryptedPacket->finish();
-
-				ret += (*sendDetour)(s, newPacket.get(), newPacket.length(), flags);
-			}
-		}
-	}
-	*/
-	if (ret == 0)
-	{
-		ret = (*sendDetour)(s, buf, len, flags);
 	}
 
 	bool login = isLogin();
@@ -127,44 +104,71 @@ int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 		packet = gFactory->make(PacketType::SERVER_GAME, &session, NString(buf, len));
 	}
 
+	int ret = 0;
+
 	auto packets = packet->decrypt();
 
-	for (auto packet : packets)
+	if (!login)
 	{
-		if (!packet.empty())
+		if (session.id() != -1)
 		{
-			if (packet.tokens().length() < 2)
+			for (auto packet : packets)
 			{
-				continue;
-			}
-
-			std::string pattern = packet.tokens().str(1);
-			if (std::find_if(filterSend.begin(), filterSend.end(), special_compare(pattern)) != filterSend.end())
-			{
-				printf("\nSend (%d, %d):\n", packets.size(), packet.tokens().length());
-				if (!showAsHex)
+				if (packet.tokens().length() < 2)
 				{
-					std::cout << ">> ";
+					continue;
+				}
 
-					for (int i = 0; i < packet.tokens().length(); ++i)
+				std::string pattern = packet.tokens().str(1);
+				if (std::find_if(filterSend.begin(), filterSend.end(), special_compare(pattern)) != filterSend.end())
+				{
+					printf("\nSend (%d, %d):\n", packets.size(), packet.tokens().length());
+					if (!showAsHex)
 					{
-						std::cout << packet.tokens()[i] << ' ';
+						std::cout << ">> ";
+
+						for (int i = 0; i < packet.tokens().length(); ++i)
+						{
+							std::cout << packet.tokens()[i] << ' ';
+						}
+
+						std::cout << std::endl;
+					}
+					else
+					{
+						for (int i = 0; i < packet.length(); ++i)
+						{
+							printf("%.2X ", (uint8_t)packet[i]);
+						}
+						printf("\n");
+					}
+				}
+
+				NString newPacket;
+				for (int i = 1; i < packet.tokens().length(); ++i)
+				{
+					if (i != 1)
+					{
+						newPacket << ' ';
 					}
 
-					std::cout << std::endl;
+					newPacket << packet.tokens()[i];
 				}
-				else
-				{
-					for (int i = 0; i < packet.length(); ++i)
-					{
-						printf("%.2X ", (uint8_t)packet[i]);
-					}
-					printf("\n");
-				}
+
+				auto reencryptedPacket = gFactory->make(PacketType::CLIENT_GAME, &session, newPacket);
+				reencryptedPacket->commit();
+				reencryptedPacket->finish();
+
+				ret += (*sendDetour)(s, reencryptedPacket->data().get(), reencryptedPacket->data().length(), flags);
 			}
 		}
 	}
 
+	if (ret == 0)
+	{
+		ret = (*sendDetour)(s, buf, len, flags);
+	}
+	
 	// Set session after decrypting
 	if (!login && session.id() == -1)
 	{
@@ -180,12 +184,36 @@ int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 	return ret;
 }
 
+void attack(uint32_t id)
+{
+	std::lock_guard<std::mutex> lock(_sendMutex);
+
+	auto packet = gFactory->make(PacketType::CLIENT_GAME, &session, NString("u_s 0 3 ") << id);
+	packet->commit();
+	packet->finish();
+
+	(*sendDetour)(sendSock, packet->data().get(), packet->data().length(), 0);
+}
+
+void attack(std::string id)
+{
+	std::lock_guard<std::mutex> lock(_sendMutex);
+
+	auto packet = gFactory->make(PacketType::CLIENT_GAME, &session, NString("u_s 0 3 ") << id);
+	packet->commit();
+	packet->finish();
+
+	(*sendDetour)(sendSock, packet->data().get(), packet->data().length(), 0);
+}
+
 int WINAPI nuestro_recv(SOCKET s, char *buf, int len, int flags)
 {
 	int ret = (*recvDetour)(s, buf, len, flags);
 
 	__asm PUSHAD;
 	__asm PUSHFD;
+
+	recvSock = s;
 
 	bool login = isLogin();
 	Packet* packet = nullptr;
@@ -195,11 +223,11 @@ int WINAPI nuestro_recv(SOCKET s, char *buf, int len, int flags)
 	}
 	else
 	{
-		printf("Is Login %d %d\n", session.alive(), session.id());
 		packet = gFactory->make(PacketType::CLIENT_GAME, &session, NString(buf, ret));
 	}
 
 	auto packets = packet->decrypt();
+
 	for (NString& packet : packets)
 	{
 		if (!packet.empty())
@@ -232,10 +260,23 @@ int WINAPI nuestro_recv(SOCKET s, char *buf, int len, int flags)
 					printf("\n");
 				}
 			}
+
+			if (packet.tokens().str(0) == "c_info")
+			{
+				int i = 1;
+				int foundSlashes = 0;
+				for (; i < packet.tokens().length() && foundSlashes < 2; ++i)
+				{
+					if (packet.tokens().str(i) == "-")
+					{
+						++foundSlashes;
+					}
+				}
+
+				ingameID = packet.tokens().from_int<uint32_t>(i);
+			}
 		}
 	}
-
-	printf("Checking %d %d %d\n", login, packets.size(), packets[0].tokens().length());
 
 	if (login && packets.size() > 0 && packets[0].tokens().length() >= 2)
 	{
@@ -285,6 +326,8 @@ void processInput()
 
 			std::vector<std::string>* filterVec;
 			bool recv = input[0] == '<';
+			bool send = input[0] == '>';
+			bool inject = input[0] == '=';
 			bool rem = input[1] == '-';
 
 			std::cout << "Recv: " << recv << " Rem: " << rem << " -- " << input << std::endl;
@@ -293,9 +336,14 @@ void processInput()
 			{
 				filterVec = &filterRecv;
 			}
-			else
+			else if (send)
 			{
 				filterVec = &filterSend;
+			}
+			else if (inject)
+			{
+				attack(input.substr(1));
+				continue;
 			}
 
 			if (rem)
