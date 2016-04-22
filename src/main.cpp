@@ -1,6 +1,7 @@
 #include <iostream>
 #include <thread>
 #include <mutex>
+#include <map>
 
 #include <xhacking/xHacking.h>
 #include <xhacking/Utilities/Utilities.h>
@@ -12,6 +13,12 @@
 #include <Cryptography/login.h>
 #include <Cryptography/game.h>
 
+
+#ifdef max
+	#undef max
+	#undef min
+#endif
+
 using namespace xHacking;
 using namespace Net;
 
@@ -19,22 +26,43 @@ using namespace Net;
 bool threadCreated = false;
 bool running;
 std::thread inputThread;
+std::thread botThread;
 std::vector<std::string> filterSend;
 std::vector<std::string> filterRecv;
+std::vector<std::string> excludeRecv;
 bool showAsHex = false;
 
 SOCKET sendSock;
 SOCKET recvSock;
-DWORD baseAddress = 0x681210;
+DWORD baseAddress = 0x686260;
 uint32_t sessionID;
 uint32_t ingameID;
 Utils::Game::Session session;
 
 std::mutex _sendMutex;
+std::mutex _entitiesMutex;
 
+
+bool isAttacking = false;
+uint32_t attackTarget = 0;
+
+using high_resolution_clock = std::chrono::high_resolution_clock;
+
+high_resolution_clock::time_point lastAttack = high_resolution_clock::now();
+std::chrono::milliseconds attackInterval(1500);
+
+
+struct EntityPosition
+{
+	uint16_t x;
+	uint16_t y;
+};
+
+std::map<uint32_t /*id*/, EntityPosition* /*pos*/> entities;
+EntityPosition selfPosition;
 
 void processInput();
-
+void botLoop();
 
 inline bool isLogin()
 {
@@ -86,9 +114,12 @@ int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 	if (!threadCreated)
 	{
 		threadCreated = true;
+
 		std::cout << "Initializing thread" << std::endl;
 		running = true;
 		inputThread = std::thread(processInput);
+		botThread = std::thread(botLoop);
+		
 		std::cout << "Done, joining" << std::endl;
 	}
 
@@ -144,6 +175,13 @@ int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 					}
 				}
 
+				std::string opcode = packet.tokens().str(1);
+				if (opcode == "walk")
+				{
+					selfPosition.x = packet.tokens().from_int<uint16_t>(2);
+					selfPosition.y = packet.tokens().from_int<uint16_t>(3);
+				}
+
 				NString newPacket;
 				for (int i = 1; i < packet.tokens().length(); ++i)
 				{
@@ -182,6 +220,17 @@ int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 	__asm POPAD;
 
 	return ret;
+}
+
+void target(uint32_t id)
+{
+	std::lock_guard<std::mutex> lock(_sendMutex);
+
+	auto packet = gFactory->make(PacketType::CLIENT_GAME, &session, NString("ncif 3 ") << id);
+	packet->commit();
+	packet->finish();
+
+	(*sendDetour)(sendSock, packet->data().get(), packet->data().length(), 0);
 }
 
 void attack(uint32_t id)
@@ -239,6 +288,11 @@ int WINAPI nuestro_recv(SOCKET s, char *buf, int len, int flags)
 
 			if (std::find_if(filterRecv.begin(), filterRecv.end(), special_compare(packet.tokens().str(0))) != filterRecv.end())
 			{
+				if (std::find_if(excludeRecv.begin(), excludeRecv.end(), special_compare(packet.tokens().str(0))) != excludeRecv.end())
+				{
+					continue;
+				}
+
 				printf("\nRecv (%d):\n", packet.tokens().length());
 				if (!showAsHex)
 				{
@@ -261,7 +315,8 @@ int WINAPI nuestro_recv(SOCKET s, char *buf, int len, int flags)
 				}
 			}
 
-			if (packet.tokens().str(0) == "c_info")
+			std::string opcode = packet.tokens().str(0);
+			if (opcode == "c_info")
 			{
 				int i = 1;
 				int foundSlashes = 0;
@@ -274,6 +329,74 @@ int WINAPI nuestro_recv(SOCKET s, char *buf, int len, int flags)
 				}
 
 				ingameID = packet.tokens().from_int<uint32_t>(i);
+			}
+			else if (opcode == "c_map")
+			{
+				std::lock_guard<std::mutex> lock(_entitiesMutex);
+
+				for (auto&& it : entities)
+				{
+					delete it.second;
+				}
+
+				entities.clear();
+			}
+			else if (opcode == "in")
+			{
+				if (packet.tokens().from_int<int>(1) == 3)
+				{
+					std::lock_guard<std::mutex> lock(_entitiesMutex);
+
+					uint32_t id = packet.tokens().from_int<uint32_t>(3);
+					entities.emplace(id, new EntityPosition{ packet.tokens().from_int<uint16_t>(4), packet.tokens().from_int<uint16_t>(5) });
+				}
+			}
+			else if (opcode == "mv")
+			{
+				if (packet.tokens().from_int<int>(1) == 3)
+				{
+					std::lock_guard<std::mutex> lock(_entitiesMutex);
+
+					uint32_t id = packet.tokens().from_int<uint32_t>(2);
+					auto it = entities.find(id);
+					if (it != entities.end())
+					{
+						it->second->x = packet.tokens().from_int<uint16_t>(3);
+						it->second->y = packet.tokens().from_int<uint16_t>(4);
+					}
+				}
+			}
+			else if (opcode == "at")
+			{
+				uint32_t id = packet.tokens().from_int<uint32_t>(1);
+				if (id == ingameID)
+				{
+					selfPosition.x = packet.tokens().from_int<uint16_t>(3);
+					selfPosition.y = packet.tokens().from_int<uint16_t>(4);
+				}
+			}
+			else if (opcode == "st")
+			{
+				if (packet.tokens().from_int<int>(1) == 3)
+				{
+					uint32_t id = packet.tokens().from_int<uint32_t>(2);
+					int hp = packet.tokens().from_int<int>(7);
+
+					if (id == attackTarget)
+					{
+						if (hp <= 0)
+						{
+							isAttacking = false;
+						}
+					}
+
+					if (hp <= 0)
+					{
+						std::lock_guard<std::mutex> lock(_entitiesMutex);
+
+						entities.erase(id);
+					}
+				}
 			}
 		}
 	}
@@ -329,6 +452,12 @@ void processInput()
 			bool send = input[0] == '>';
 			bool inject = input[0] == '=';
 			bool rem = input[1] == '-';
+			bool excl = input[1] == '/';
+
+			if (excl)
+			{
+				rem = input[2] == '-';
+			}
 
 			std::cout << "Recv: " << recv << " Rem: " << rem << " -- " << input << std::endl;
 
@@ -345,6 +474,18 @@ void processInput()
 				attack(input.substr(1));
 				continue;
 			}
+			
+			if (excl)
+			{
+				if (!rem)
+				{
+					input = input.substr(1);
+				}
+
+				filterVec = &excludeRecv;
+
+				printf("Excluding %s\n", input.c_str());
+			}
 
 			if (rem)
 			{
@@ -357,6 +498,50 @@ void processInput()
 				filterVec->push_back(filter);
 			}
 		}
+	}
+}
+
+void botLoop()
+{
+	while (running)
+	{
+		if (!isLogin())
+		{
+			if (!isAttacking)
+			{
+				std::lock_guard<std::mutex> lock(_entitiesMutex);
+
+				int dist = std::numeric_limits<int>::max();
+				for (auto&& it : entities)
+				{
+					int currentDist = ((int)selfPosition.x - (int)it.second->x) * ((int)selfPosition.x - (int)it.second->x) +
+						((int)selfPosition.y - (int)it.second->y) * ((int)selfPosition.y - (int)it.second->y);
+
+					if (currentDist < dist)
+					{
+						dist = currentDist;
+						attackTarget = it.first;
+					}
+				}
+
+				if (dist < 15)
+				{
+					isAttacking = true;
+				}
+			}
+
+			if (isAttacking)
+			{
+				if (std::chrono::duration_cast<std::chrono::milliseconds>(high_resolution_clock::now() - lastAttack) > attackInterval)
+				{
+					target(attackTarget);
+					attack(attackTarget);
+					lastAttack = high_resolution_clock::now();
+				}
+			}
+		}
+
+		std::this_thread::sleep_for(std::chrono::milliseconds(500));
 	}
 }
 
@@ -374,6 +559,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, DWORD reserved)
 	{
 		running = false;
 		inputThread.join();
+		botThread.join();
 	}
 
 	return true;
