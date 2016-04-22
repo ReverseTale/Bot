@@ -41,10 +41,12 @@ Utils::Game::Session session;
 
 std::mutex _sendMutex;
 std::mutex _entitiesMutex;
+std::mutex _dropsMutex;
 
-
+bool isLooting = false;
 bool isAttacking = false;
 uint32_t attackTarget = 0;
+uint32_t lootTarget = 0;
 
 using high_resolution_clock = std::chrono::high_resolution_clock;
 
@@ -56,9 +58,29 @@ struct EntityPosition
 {
 	uint16_t x;
 	uint16_t y;
+
+	EntityPosition() :
+		EntityPosition(0, 0)
+	{}
+
+	EntityPosition(uint16_t x, uint16_t y) :
+		x(x), y(y)
+	{}
+};
+
+struct Entity : public EntityPosition
+{
+	uint32_t type;
+	uint32_t amount;
+
+	Entity(uint32_t type, uint32_t amount, uint16_t x, uint16_t y) :
+		type(type), amount(amount),
+		EntityPosition(x, y)
+	{}
 };
 
 std::map<uint32_t /*id*/, EntityPosition* /*pos*/> entities;
+std::map<uint32_t /*id*/, Entity*  /*item*/> drops;
 EntityPosition selfPosition;
 
 void processInput();
@@ -244,6 +266,17 @@ void attack(uint32_t id)
 	(*sendDetour)(sendSock, packet->data().get(), packet->data().length(), 0);
 }
 
+void loot(uint32_t id)
+{
+	std::lock_guard<std::mutex> lock(_sendMutex);
+
+	auto packet = gFactory->make(PacketType::CLIENT_GAME, &session, NString("get 1 ") << ingameID << ' ' << id);
+	packet->commit();
+	packet->finish();
+
+	(*sendDetour)(sendSock, packet->data().get(), packet->data().length(), 0);
+}
+
 void attack(std::string id)
 {
 	std::lock_guard<std::mutex> lock(_sendMutex);
@@ -398,6 +431,35 @@ int WINAPI nuestro_recv(SOCKET s, char *buf, int len, int flags)
 					}
 				}
 			}
+			else if (opcode == "drop")
+			{
+				uint32_t owner = packet.tokens().from_int<uint32_t>(7);
+				if (owner == ingameID)
+				{
+					uint32_t type = packet.tokens().from_int<uint32_t>(1);
+					uint32_t id = packet.tokens().from_int<uint32_t>(2);
+					uint16_t x = packet.tokens().from_int<uint16_t>(3);
+					uint16_t y = packet.tokens().from_int<uint16_t>(4);
+					uint32_t amount = packet.tokens().from_int<uint32_t>(5);
+
+					std::lock_guard<std::mutex> lock(_dropsMutex);
+					drops.emplace(id, new Entity { type, amount, x, y });
+				}
+			}
+			else if (opcode == "get")
+			{
+				uint8_t confirm = packet.tokens().from_int<uint32_t>(1);
+				uint32_t owner = packet.tokens().from_int<uint32_t>(2);
+				uint32_t id = packet.tokens().from_int<uint16_t>(3);
+
+				if (confirm == 1 && owner == ingameID && id == lootTarget)
+				{
+					isLooting = false;
+
+					std::lock_guard<std::mutex> lock(_dropsMutex);
+					drops.erase(id);
+				}
+			}
 		}
 	}
 
@@ -507,9 +569,18 @@ void botLoop()
 	{
 		if (!isLogin())
 		{
-			if (!isAttacking)
+			if (!isAttacking && !isLooting)
 			{
-				std::lock_guard<std::mutex> lock(_entitiesMutex);
+				std::lock_guard<std::mutex> dropLock(_dropsMutex);
+				if (!drops.empty())
+				{
+					isLooting = true;
+					lootTarget = drops.begin()->first;
+					loot(lootTarget);
+					continue;
+				}
+
+				std::lock_guard<std::mutex> entitiesLock(_entitiesMutex);
 
 				int dist = std::numeric_limits<int>::max();
 				for (auto&& it : entities)
