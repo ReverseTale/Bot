@@ -2,6 +2,7 @@
 #include <thread>
 #include <mutex>
 #include <map>
+#include <fstream>
 
 #include <xhacking/xHacking.h>
 #include <xhacking/Utilities/Utilities.h>
@@ -25,6 +26,7 @@ using namespace Net;
 
 bool threadCreated = false;
 bool running;
+std::ofstream logger;
 std::thread inputThread;
 std::thread botThread;
 std::vector<std::string> filterSend;
@@ -179,13 +181,16 @@ int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 					if (!showAsHex)
 					{
 						std::cout << ">> ";
+						logger << ">> ";
 
 						for (int i = 0; i < packet.tokens().length(); ++i)
 						{
 							std::cout << packet.tokens()[i] << ' ';
+							logger << packet.tokens()[i] << ' ';
 						}
 
 						std::cout << std::endl;
+						logger << std::endl;
 					}
 					else
 					{
@@ -330,13 +335,16 @@ int WINAPI nuestro_recv(SOCKET s, char *buf, int len, int flags)
 				if (!showAsHex)
 				{
 					std::cout << "<< ";
+					logger << "<< ";
 
 					for (int i = 0; i < packet.tokens().length(); ++i)
 					{
 						std::cout << packet.tokens()[i] << ' ';
+						logger << packet.tokens()[i] << ' ';
 					}
 
 					std::cout << std::endl;
+					logger << std::endl;
 				}
 				else
 				{
@@ -509,6 +517,13 @@ void processInput()
 				continue;
 			}
 
+			if (input.compare("savelog") == 0)
+			{
+				logger.close();
+				logger.open("nostale.log", std::ios::app);
+				continue;
+			}
+
 			std::vector<std::string>* filterVec;
 			bool recv = input[0] == '<';
 			bool send = input[0] == '>';
@@ -625,9 +640,13 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, DWORD reserved)
 
 		// Call our function
 		Hooks();
+
+		// Open logging file
+		logger.open("nostale.log", std::ios::trunc);
 	}
 	else if (reason == DLL_PROCESS_DETACH)
 	{
+		logger.close();
 		running = false;
 		inputThread.join();
 		botThread.join();
