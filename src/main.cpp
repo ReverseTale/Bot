@@ -4,6 +4,11 @@
 #include <map>
 #include <fstream>
 
+#include "player.hpp"
+#include "attack.hpp"
+#include "loot.hpp"
+#include "sender.hpp"
+
 #include <xhacking/xHacking.h>
 #include <xhacking/Utilities/Utilities.h>
 #include <xhacking/Loader/Loader.h>
@@ -23,6 +28,8 @@
 using namespace xHacking;
 using namespace Net;
 
+xHacking::Detour<int, int, const char*, int, int>* sendDetour = NULL;
+xHacking::Detour<int, int, char*, int, int>* recvDetour = NULL;
 
 bool threadCreated = false;
 bool running;
@@ -36,64 +43,18 @@ bool showAsHex = false;
 
 SOCKET sendSock;
 SOCKET recvSock;
-DWORD baseAddress = 0x686260;
 uint32_t sessionID;
-uint32_t ingameID;
 Utils::Game::Session session;
 
-std::mutex _sendMutex;
-std::mutex _entitiesMutex;
-std::mutex _dropsMutex;
-
-bool isLooting = false;
-bool isAttacking = false;
-uint32_t attackTarget = 0;
-uint32_t lootTarget = 0;
-
-using high_resolution_clock = std::chrono::high_resolution_clock;
-
-high_resolution_clock::time_point lastAttack = high_resolution_clock::now();
-std::chrono::milliseconds attackInterval(1500);
-
-
-struct EntityPosition
-{
-	uint16_t x;
-	uint16_t y;
-
-	EntityPosition() :
-		EntityPosition(0, 0)
-	{}
-
-	EntityPosition(uint16_t x, uint16_t y) :
-		x(x), y(y)
-	{}
-};
-
-struct Entity : public EntityPosition
-{
-	uint32_t type;
-	uint32_t amount;
-
-	Entity(uint32_t type, uint32_t amount, uint16_t x, uint16_t y) :
-		type(type), amount(amount),
-		EntityPosition(x, y)
-	{}
-};
-
-std::map<uint32_t /*id*/, EntityPosition* /*pos*/> entities;
-std::map<uint32_t /*id*/, Entity*  /*item*/> drops;
-EntityPosition selfPosition;
 
 void processInput();
 void botLoop();
 
-inline bool isLogin()
-{
-	DWORD pointer1 = *(DWORD*)(baseAddress);
-	DWORD pointer2 = *(DWORD*)(pointer1);
-	return *(BYTE*)(pointer2 + 0x31) == 0x00;
-}
+std::list<Module*> _modules;
+PlayerModule* _player = nullptr;
+AttackModule* _attack = nullptr;
+LootModule* _loot = nullptr;
+
 
 struct special_compare : public std::unary_function<std::string, bool>
 {
@@ -124,16 +85,15 @@ struct special_compare : public std::unary_function<std::string, bool>
 	std::string baseline;
 };
 
-Detour<int, int, const char*, int, int>* sendDetour = NULL;
-Detour<int, int, char*, int, int>* recvDetour = NULL;
 int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 {
 	__asm PUSHAD;
 	__asm PUSHFD;
 
+	Sender::get()->setSendSocket(s);
 	sendSock = s;
 
-	std::lock_guard<std::mutex> lock(_sendMutex);
+	std::lock_guard<std::mutex> lock(Sender::get()->acquire());
 
 	if (!threadCreated)
 	{
@@ -147,7 +107,7 @@ int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 		std::cout << "Done, joining" << std::endl;
 	}
 
-	bool login = isLogin();
+	bool login = _player->isAtLogin();
 	Packet* packet = nullptr;
 	if (login)
 	{
@@ -177,19 +137,15 @@ int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 				std::string pattern = packet.tokens().str(1);
 				if (std::find_if(filterSend.begin(), filterSend.end(), special_compare(pattern)) != filterSend.end())
 				{
-					printf("\nSend (%d, %d):\n", packets.size(), packet.tokens().length());
 					if (!showAsHex)
 					{
-						std::cout << ">> ";
 						logger << ">> ";
 
 						for (int i = 0; i < packet.tokens().length(); ++i)
 						{
-							std::cout << packet.tokens()[i] << ' ';
 							logger << packet.tokens()[i] << ' ';
 						}
 
-						std::cout << std::endl;
 						logger << std::endl;
 					}
 					else
@@ -202,13 +158,11 @@ int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 					}
 				}
 
-				std::string opcode = packet.tokens().str(1);
-				if (opcode == "walk")
+				for (Module* module : _modules)
 				{
-					selfPosition.x = packet.tokens().from_int<uint16_t>(2);
-					selfPosition.y = packet.tokens().from_int<uint16_t>(3);
+					module->onReceive(packet);
 				}
-
+				
 				NString newPacket;
 				for (int i = 1; i < packet.tokens().length(); ++i)
 				{
@@ -249,50 +203,6 @@ int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 	return ret;
 }
 
-void target(uint32_t id)
-{
-	std::lock_guard<std::mutex> lock(_sendMutex);
-
-	auto packet = gFactory->make(PacketType::CLIENT_GAME, &session, NString("ncif 3 ") << id);
-	packet->commit();
-	packet->finish();
-
-	(*sendDetour)(sendSock, packet->data().get(), packet->data().length(), 0);
-}
-
-void attack(uint32_t id)
-{
-	std::lock_guard<std::mutex> lock(_sendMutex);
-
-	auto packet = gFactory->make(PacketType::CLIENT_GAME, &session, NString("u_s 0 3 ") << id);
-	packet->commit();
-	packet->finish();
-
-	(*sendDetour)(sendSock, packet->data().get(), packet->data().length(), 0);
-}
-
-void loot(uint32_t id)
-{
-	std::lock_guard<std::mutex> lock(_sendMutex);
-
-	auto packet = gFactory->make(PacketType::CLIENT_GAME, &session, NString("get 1 ") << ingameID << ' ' << id);
-	packet->commit();
-	packet->finish();
-
-	(*sendDetour)(sendSock, packet->data().get(), packet->data().length(), 0);
-}
-
-void attack(std::string id)
-{
-	std::lock_guard<std::mutex> lock(_sendMutex);
-
-	auto packet = gFactory->make(PacketType::CLIENT_GAME, &session, NString("u_s 0 3 ") << id);
-	packet->commit();
-	packet->finish();
-
-	(*sendDetour)(sendSock, packet->data().get(), packet->data().length(), 0);
-}
-
 int WINAPI nuestro_recv(SOCKET s, char *buf, int len, int flags)
 {
 	int ret = (*recvDetour)(s, buf, len, flags);
@@ -302,7 +212,7 @@ int WINAPI nuestro_recv(SOCKET s, char *buf, int len, int flags)
 
 	recvSock = s;
 
-	bool login = isLogin();
+	bool login = _player->isAtLogin();
 	Packet* packet = nullptr;
 	if (login)
 	{
@@ -331,19 +241,15 @@ int WINAPI nuestro_recv(SOCKET s, char *buf, int len, int flags)
 					continue;
 				}
 
-				printf("\nRecv (%d):\n", packet.tokens().length());
 				if (!showAsHex)
 				{
-					std::cout << "<< ";
 					logger << "<< ";
 
 					for (int i = 0; i < packet.tokens().length(); ++i)
 					{
-						std::cout << packet.tokens()[i] << ' ';
 						logger << packet.tokens()[i] << ' ';
 					}
 
-					std::cout << std::endl;
 					logger << std::endl;
 				}
 				else
@@ -356,126 +262,16 @@ int WINAPI nuestro_recv(SOCKET s, char *buf, int len, int flags)
 				}
 			}
 
-			std::string opcode = packet.tokens().str(0);
-			if (opcode == "c_info")
+			for (Module* module : _modules)
 			{
-				int i = 1;
-				int foundSlashes = 0;
-				for (; i < packet.tokens().length() && foundSlashes < 2; ++i)
-				{
-					if (packet.tokens().str(i) == "-")
-					{
-						++foundSlashes;
-					}
-				}
-
-				ingameID = packet.tokens().from_int<uint32_t>(i);
-			}
-			else if (opcode == "c_map")
-			{
-				std::lock_guard<std::mutex> lock(_entitiesMutex);
-
-				for (auto&& it : entities)
-				{
-					delete it.second;
-				}
-
-				entities.clear();
-			}
-			else if (opcode == "in")
-			{
-				if (packet.tokens().from_int<int>(1) == 3)
-				{
-					std::lock_guard<std::mutex> lock(_entitiesMutex);
-
-					uint32_t id = packet.tokens().from_int<uint32_t>(3);
-					entities.emplace(id, new EntityPosition{ packet.tokens().from_int<uint16_t>(4), packet.tokens().from_int<uint16_t>(5) });
-				}
-			}
-			else if (opcode == "mv")
-			{
-				if (packet.tokens().from_int<int>(1) == 3)
-				{
-					std::lock_guard<std::mutex> lock(_entitiesMutex);
-
-					uint32_t id = packet.tokens().from_int<uint32_t>(2);
-					auto it = entities.find(id);
-					if (it != entities.end())
-					{
-						it->second->x = packet.tokens().from_int<uint16_t>(3);
-						it->second->y = packet.tokens().from_int<uint16_t>(4);
-					}
-				}
-			}
-			else if (opcode == "at")
-			{
-				uint32_t id = packet.tokens().from_int<uint32_t>(1);
-				if (id == ingameID)
-				{
-					selfPosition.x = packet.tokens().from_int<uint16_t>(3);
-					selfPosition.y = packet.tokens().from_int<uint16_t>(4);
-				}
-			}
-			else if (opcode == "st")
-			{
-				if (packet.tokens().from_int<int>(1) == 3)
-				{
-					uint32_t id = packet.tokens().from_int<uint32_t>(2);
-					int hp = packet.tokens().from_int<int>(7);
-
-					if (id == attackTarget)
-					{
-						if (hp <= 0)
-						{
-							isAttacking = false;
-						}
-					}
-
-					if (hp <= 0)
-					{
-						std::lock_guard<std::mutex> lock(_entitiesMutex);
-
-						entities.erase(id);
-					}
-				}
-			}
-			else if (opcode == "drop")
-			{
-				uint32_t owner = packet.tokens().from_int<uint32_t>(7);
-				if (owner == ingameID)
-				{
-					uint32_t type = packet.tokens().from_int<uint32_t>(1);
-					uint32_t id = packet.tokens().from_int<uint32_t>(2);
-					uint16_t x = packet.tokens().from_int<uint16_t>(3);
-					uint16_t y = packet.tokens().from_int<uint16_t>(4);
-					uint32_t amount = packet.tokens().from_int<uint32_t>(5);
-
-					std::lock_guard<std::mutex> lock(_dropsMutex);
-					drops.emplace(id, new Entity { type, amount, x, y });
-				}
-			}
-			else if (opcode == "get")
-			{
-				uint8_t confirm = packet.tokens().from_int<uint32_t>(1);
-				uint32_t owner = packet.tokens().from_int<uint32_t>(2);
-				uint32_t id = packet.tokens().from_int<uint16_t>(3);
-
-				if (confirm == 1 && owner == ingameID && id == lootTarget)
-				{
-					isLooting = false;
-
-					std::lock_guard<std::mutex> lock(_dropsMutex);
-					drops.erase(id);
-				}
+				module->onReceive(packet);
 			}
 		}
 	}
 
 	if (login && packets.size() > 0 && packets[0].tokens().length() >= 2)
 	{
-		printf("Getting ID\n");
 		sessionID = packets[0].tokens().from_int<uint32_t>(1);
-		printf("SAVING SESSION ID %d\n", sessionID);
 	}
 
 	gFactory->recycle(packet);
@@ -506,74 +302,85 @@ void processInput()
 	while (running)
 	{
 		std::string input;
-		std::cout << "Enter Filter: ";
+		std::cout << "1. Filter options" << std::endl;
+		std::cout << "2. Enable/Disable Auto-Attack (" << std::boolalpha << _attack->isEnabled() << ")" << std::endl;
+		std::cout << "3. Enable/Disable Auto-Loot (" << std::boolalpha << _loot->isEnabled() << ")" << std::endl;
+		std::cout << "Choose an option 1-3: ";
 		std::cin >> input;
 
-		if (input.length() >= 2)
+		if (input[0] == '1')
 		{
-			if (input.compare("toggle_hex") == 0)
-			{
-				showAsHex = !showAsHex;
-				continue;
-			}
+			std::cout << "Enter filter option: ";
+			std::cin >> input;
 
-			if (input.compare("savelog") == 0)
+			if (input.length() >= 2)
 			{
-				logger.close();
-				logger.open("nostale.log", std::ios::app);
-				continue;
-			}
-
-			std::vector<std::string>* filterVec;
-			bool recv = input[0] == '<';
-			bool send = input[0] == '>';
-			bool inject = input[0] == '=';
-			bool rem = input[1] == '-';
-			bool excl = input[1] == '/';
-
-			if (excl)
-			{
-				rem = input[2] == '-';
-			}
-
-			std::cout << "Recv: " << recv << " Rem: " << rem << " -- " << input << std::endl;
-
-			if (recv)
-			{
-				filterVec = &filterRecv;
-			}
-			else if (send)
-			{
-				filterVec = &filterSend;
-			}
-			else if (inject)
-			{
-				attack(input.substr(1));
-				continue;
-			}
-			
-			if (excl)
-			{
-				if (!rem)
+				if (input.compare("toggle_hex") == 0)
 				{
-					input = input.substr(1);
+					showAsHex = !showAsHex;
+					continue;
 				}
 
-				filterVec = &excludeRecv;
+				if (input.compare("savelog") == 0)
+				{
+					logger.close();
+					logger.open("nostale.log", std::ios::app);
+					continue;
+				}
 
-				printf("Excluding %s\n", input.c_str());
-			}
+				std::vector<std::string>* filterVec;
+				bool recv = input[0] == '<';
+				bool send = input[0] == '>';
+				bool rem = input[1] == '-';
+				bool excl = input[1] == '/';
 
-			if (rem)
-			{
-				std::string filter = input.substr(2);
-				filterVec->erase(std::remove(filterVec->begin(), filterVec->end(), filter), filterVec->end());
+				if (excl)
+				{
+					rem = input[2] == '-';
+				}
+
+				std::cout << "Recv: " << recv << " Rem: " << rem << " -- " << input << std::endl;
+
+				if (recv)
+				{
+					filterVec = &filterRecv;
+				}
+				else if (send)
+				{
+					filterVec = &filterSend;
+				}
+
+				if (excl)
+				{
+					if (!rem)
+					{
+						input = input.substr(1);
+					}
+
+					filterVec = &excludeRecv;
+
+					printf("Excluding %s\n", input.c_str());
+				}
+
+				if (rem)
+				{
+					std::string filter = input.substr(2);
+					filterVec->erase(std::remove(filterVec->begin(), filterVec->end(), filter), filterVec->end());
+				}
+				else
+				{
+					std::string filter = input.substr(1);
+					filterVec->push_back(filter);
+				}
 			}
-			else
-			{
-				std::string filter = input.substr(1);
-				filterVec->push_back(filter);
-			}
+		}
+		else if (input[0] == '2')
+		{
+			_attack->toggle();
+		}
+		else if (input[0] == '3')
+		{
+			_loot->toggle();
 		}
 	}
 }
@@ -582,48 +389,11 @@ void botLoop()
 {
 	while (running)
 	{
-		if (!isLogin())
+		for (Module* module : _modules)
 		{
-			if (!isAttacking && !isLooting)
+			if (module->isEnabled())
 			{
-				std::lock_guard<std::mutex> dropLock(_dropsMutex);
-				if (!drops.empty())
-				{
-					isLooting = true;
-					lootTarget = drops.begin()->first;
-					loot(lootTarget);
-					continue;
-				}
-
-				std::lock_guard<std::mutex> entitiesLock(_entitiesMutex);
-
-				int dist = std::numeric_limits<int>::max();
-				for (auto&& it : entities)
-				{
-					int currentDist = ((int)selfPosition.x - (int)it.second->x) * ((int)selfPosition.x - (int)it.second->x) +
-						((int)selfPosition.y - (int)it.second->y) * ((int)selfPosition.y - (int)it.second->y);
-
-					if (currentDist < dist)
-					{
-						dist = currentDist;
-						attackTarget = it.first;
-					}
-				}
-
-				if (dist < 15)
-				{
-					isAttacking = true;
-				}
-			}
-
-			if (isAttacking)
-			{
-				if (std::chrono::duration_cast<std::chrono::milliseconds>(high_resolution_clock::now() - lastAttack) > attackInterval)
-				{
-					target(attackTarget);
-					attack(attackTarget);
-					lastAttack = high_resolution_clock::now();
-				}
+				module->update();
 			}
 		}
 
@@ -637,6 +407,12 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, DWORD reserved)
 	{
 		// Use the xHacking::CreateConsole function
 		CreateConsole();
+		
+		// Initialize modules
+		_player = new PlayerModule(&session);
+		_attack = new AttackModule(_player, &session);
+		_loot = new LootModule(_player, &session);
+		_modules = { _player, _loot, _attack }; // Loot must be first
 
 		// Call our function
 		Hooks();

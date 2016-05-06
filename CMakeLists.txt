@@ -7,7 +7,7 @@ String2List(${CMAKE_PREFIX_PATH} CMAKE_PREFIX_PATH)
 String2List(${CMAKE_MODULE_PATH} CMAKE_MODULE_PATH)
 
 # ---[ Find all source and header files
-file(GLOB_RECURSE sources_Bot       src/*.cpp     src/*.h)
+file(GLOB_RECURSE sources_Bot       src/*.cpp     src/*.hpp)
 set(Bot_SOURCES
     ${sources_Bot}
 )
