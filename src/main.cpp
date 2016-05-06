@@ -160,7 +160,7 @@ int WINAPI nuestro_send(SOCKET s, const char *buf, int len, int flags)
 
 				for (Module* module : _modules)
 				{
-					module->onReceive(packet);
+					module->onSend(packet);
 				}
 				
 				NString newPacket;
